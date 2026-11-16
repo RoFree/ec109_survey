@@ -3,7 +3,7 @@
  */
 window.SURVEY_CONFIG = {
   // REQUIRED: the Web App URL from your Apps Script deployment. It ends in /exec.
-  APPS_SCRIPT_URL: "",
+  APPS_SCRIPT_URL: "https://script.google.com/macros/s/AKfycbx2RVs1bd91-QqC7hbBsokN8oLtYItkCvpdRNvcqE5wGSb9G1qBDHWgySXtfgO_dQEsuQ/exec",
 
   // Optional: a contact address shown on the welcome page. Leave "" to hide it.
   CONTACT_EMAIL: "",
