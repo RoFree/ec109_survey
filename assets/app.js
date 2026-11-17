@@ -192,9 +192,61 @@
   }
 
   function go(delta) {
+    const stageBefore = stageOf(flow[state.step]);
     state.step = Math.max(0, Math.min(flow.length - 1, state.step + delta));
     saveState();
     render();
+    if (stageOf(flow[state.step]) !== stageBefore) track('stage');
+  }
+
+  // ------------------------------------------------------------------ drop-off tracking
+  //
+  // Small fire-and-forget pings to the backend so the Sessions tab can show who left
+  // before finishing, by condition. Sent on every page load, at each new stage, and when
+  // the tab is hidden or closed. They carry only the random respondent_id, the assigned
+  // condition and part order, the stage, and progress. They never include answers,
+  // name, or email.
+
+  function stageOf(scr) {
+    if (!scr) return 'welcome';
+    if (scr.type === 'phase' || scr.type === 'rate' || scr.type === 'price') return scr.group === 'p1' ? 'part1' : 'part2';
+    if (scr.type === 'submit') return 'demographics'; // completion is recorded by the submission itself
+    return scr.type; // welcome | identity | instructions | demographics
+  }
+
+  function progressPct() {
+    if (state.step <= 0) return 0;
+    return Math.max(0, Math.min(100, Math.round((100 * (state.step - 1)) / Math.max(1, flow.length - 2))));
+  }
+
+  let lastTrackKey = '';
+  function track(event) {
+    // On by default; add TRACK_PROGRESS: false to config.js to turn it off.
+    if (C.TRACK_PROGRESS === false || !C.APPS_SCRIPT_URL || !state || alreadyCompleted()) return;
+    const stage = stageOf(flow[state.step]);
+    const pct = progressPct();
+    const key = `${stage}|${pct}`;
+    if (event !== 'load' && key === lastTrackKey) return; // nothing new since the last ping
+    lastTrackKey = key;
+    const body = JSON.stringify({
+      type: 'track',
+      event, // load | stage | hide
+      respondent_id: state.respondent_id,
+      condition: state.condition,
+      phase_order: state.phase_order,
+      survey_version: VERSION_TAG,
+      stage,
+      progress_pct: pct,
+      consented: !!state.started_at,
+    });
+    // sendBeacon survives the page closing; the backend acts on the POST itself, so the
+    // response (a redirect) never needs to be read.
+    try {
+      if (navigator.sendBeacon && navigator.sendBeacon(C.APPS_SCRIPT_URL, new Blob([body], { type: 'text/plain;charset=utf-8' }))) return;
+    } catch (e) { /* fall through to fetch */ }
+    try {
+      fetch(C.APPS_SCRIPT_URL, { method: 'POST', mode: 'no-cors', keepalive: true, headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body }).catch(() => {});
+    } catch (e) { /* tracking is best-effort */ }
   }
 
   // ------------------------------------------------------------------ rendering
@@ -289,7 +341,7 @@
         <p class="eyebrow">${esc(C.STUDY_TAGLINE)}</p>
         <h1>${esc(C.STUDY_TITLE)}</h1>
         <p class="lead">You will read ${N_JOBS} short descriptions of hypothetical job offers. For each one, you'll tell us how morally objectionable you find it and the lowest pay at which you would accept it. It takes about ${esc(C.ESTIMATED_MINUTES)} minutes.</p>
-        <p>There are no right or wrong answers. Taking part is voluntary, and you can stop at any time by closing this page. Nothing is sent to the researchers unless you reach the end and submit.</p>
+        <p>There are no right or wrong answers. Taking part is voluntary, and you can stop at any time. You can also close this page and come back later on the same device and browser to pick up where you left off. Your responses are not sent to the researchers unless you reach the end and submit.</p>
         ${notice}
         <label class="check">
           <input type="checkbox" id="consent" aria-labelledby="consent-text"${state.consent ? ' checked' : ''}>
@@ -778,4 +830,10 @@
   if (!(state.step >= 0 && state.step < flow.length)) state.step = 0;
   saveState();
   render();
+
+  track('load'); // one per page load, so the backend can count visits
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') track('hide');
+  });
+  window.addEventListener('pagehide', () => track('hide'));
 })();
