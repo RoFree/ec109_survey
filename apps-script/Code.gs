@@ -1,17 +1,25 @@
 /**
  * Career Choices Study (Ec 109): Google Apps Script backend.
  *
- * Receives one JSON submission per completed survey from the website and writes it to
- * two tabs in the Google Sheet this script is attached to:
+ * Receives JSON from the website and writes it to three tabs in the Google Sheet this
+ * script is attached to:
  *
  *   Respondents : one row per completed survey
  *   Responses   : one row per respondent x job
+ *   Sessions    : one row per browser that opened the survey (finished or not), updated by
+ *                 small progress pings, for drop-off analysis by condition. Contains no
+ *                 answers, names, or emails.
  *
  * Setup steps are in README.md. In short:
  *   1. Extensions > Apps Script in your Sheet, paste this file, save.
  *   2. Run `setup` once and authorize it.
  *   3. Deploy > New deployment > Web app, Execute as: Me, Who has access: Anyone.
  *   4. Put the /exec URL into config.js on the website.
+ *
+ * Already collecting data with an older version of this script? Replace the code, run
+ * `addSessionsTab` once (it only creates the Sessions tab and never touches Respondents or
+ * Responses), then Deploy > Manage deployments > edit > Version: New version > Deploy.
+ * Do NOT create a new deployment: that would change the URL the website posts to.
  *
  * Columns are matched by header name, so you may reorder columns or add your own
  * analysis columns to the right without breaking anything. Do not rename the headers.
@@ -32,16 +40,26 @@ const RESPONSE_HEADERS = [
   'moral_rating', 'min_salary_usd', 'priceless',
 ];
 
+const SESSIONS_SHEET = 'Sessions';
+const SESSION_HEADERS = [
+  'respondent_id', 'condition', 'phase_order', 'survey_version', 'first_seen_at',
+  'last_seen_at', 'visits', 'consented', 'furthest_stage', 'furthest_progress_pct',
+  'completed', 'completed_at',
+];
+// Stages in survey order; furthest_stage only ever moves forward.
+const STAGES = ['welcome', 'identity', 'instructions', 'part1', 'part2', 'demographics', 'completed'];
+
 const REQUIRED_EMAIL_DOMAIN = 'caltech.edu';
 const SALARY_MAX = 10000000;
 const MAX_JOBS_PER_SUBMISSION = 60;
 const MAX_SUBMISSIONS_PER_MINUTE = 120; // crude flood protection for a public endpoint
+const MAX_TRACK_PINGS_PER_MINUTE = 600;
 
 const TEXT_COLUMNS = [
   'respondent_id', 'condition', 'phase_order', 'category_order', 'class_year', 'major',
-  'name', 'email', 'survey_version', 'category_name', 'job_id', 'job_title',
+  'name', 'email', 'survey_version', 'category_name', 'job_id', 'job_title', 'furthest_stage',
 ];
-const DATETIME_COLUMNS = ['submitted_at', 'started_at', 'completed_at'];
+const DATETIME_COLUMNS = ['submitted_at', 'started_at', 'completed_at', 'first_seen_at', 'last_seen_at'];
 const USD_COLUMNS = ['min_salary_usd'];
 
 // ============================================================ web app entry points
@@ -51,7 +69,10 @@ function doGet() {
   return json_({ ok: true, message: 'Survey endpoint is running.' });
 }
 
-/** Receives a survey submission (JSON sent as text/plain to avoid a CORS preflight). */
+/**
+ * Receives a survey submission or a progress ping (JSON sent as text/plain to avoid a
+ * CORS preflight). Progress pings have type "track".
+ */
 function doPost(e) {
   let payload;
   try {
@@ -59,6 +80,8 @@ function doPost(e) {
   } catch (err) {
     return json_({ ok: false, error: 'Invalid JSON.' });
   }
+
+  if (payload && payload.type === 'track') return handleTrack_(payload);
 
   let clean;
   try {
@@ -72,7 +95,7 @@ function doPost(e) {
     return json_({ ok: false, error: 'The server is busy. Please try again.' });
   }
   try {
-    if (!underRateLimit_()) {
+    if (!underRateLimit_('submit', MAX_SUBMISSIONS_PER_MINUTE)) {
       return json_({ ok: false, error: 'Too many submissions right now. Please try again in a minute.' });
     }
 
@@ -118,6 +141,24 @@ function doPost(e) {
     // Write the per-job rows first; the Respondents row marks the submission as complete.
     appendRecords_(responses, responseRows);
     appendRecords_(respondents, [respondentRow]);
+
+    // Mark the session as completed (creates the row if no progress pings arrived).
+    const sessions = getOrCreateSheet_(ss, SESSIONS_SHEET, SESSION_HEADERS);
+    upsertSession_(sessions, clean.respondent_id, (rec, isNew) => {
+      if (isNew) {
+        rec.first_seen_at = clean.started_at || now;
+        rec.visits = 0;
+      }
+      rec.condition = clean.condition;
+      rec.phase_order = clean.phase_order;
+      rec.survey_version = clean.survey_version;
+      rec.last_seen_at = now;
+      rec.consented = true;
+      rec.furthest_stage = 'completed';
+      rec.furthest_progress_pct = 100;
+      rec.completed = true;
+      rec.completed_at = now;
+    });
     SpreadsheetApp.flush();
 
     return json_({ ok: true });
@@ -131,12 +172,120 @@ function doPost(e) {
 
 // ============================================================ one-time setup & testing
 
-/** Run once from the Apps Script editor: creates both tabs with headers and formatting. */
+/** Run once from the Apps Script editor: creates all three tabs with headers and formatting. */
 function setup() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   getOrCreateSheet_(ss, RESPONDENTS_SHEET, RESPONDENT_HEADERS, true);
   getOrCreateSheet_(ss, RESPONSES_SHEET, RESPONSE_HEADERS, true);
-  console.log('Setup complete: "%s" and "%s" tabs are ready.', RESPONDENTS_SHEET, RESPONSES_SHEET);
+  getOrCreateSheet_(ss, SESSIONS_SHEET, SESSION_HEADERS, true);
+  console.log('Setup complete: "%s", "%s", and "%s" tabs are ready.', RESPONDENTS_SHEET, RESPONSES_SHEET, SESSIONS_SHEET);
+}
+
+/**
+ * For a study that is already running: creates only the Sessions tab (headers and
+ * formatting). Respondents and Responses, and all their data, are left exactly as they are.
+ * Safe to run more than once.
+ */
+function addSessionsTab() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  getOrCreateSheet_(ss, SESSIONS_SHEET, SESSION_HEADERS, true);
+  console.log('"%s" tab is ready. Respondents and Responses were not modified.', SESSIONS_SHEET);
+}
+
+// ============================================================ drop-off tracking
+
+/**
+ * Progress ping from the website: updates (or creates) this browser's row in Sessions.
+ * Best-effort: if the server is busy, the ping is dropped; the next one catches up.
+ */
+function handleTrack_(p) {
+  let t;
+  try {
+    t = {
+      respondent_id: String(p.respondent_id || ''),
+      condition: oneOf_(p.condition, ['anonymous', 'identified'], 'condition'),
+      phase_order: oneOf_(p.phase_order, ['rating_first', 'salary_first'], 'phase_order'),
+      survey_version: text_(p.survey_version, 40, 'survey_version', false),
+      event: oneOf_(p.event, ['load', 'stage', 'hide'], 'event'),
+      stage: oneOf_(p.stage, STAGES.slice(0, -1), 'stage'),
+      progress_pct: int_(p.progress_pct, 0, 100, 'progress_pct'),
+      consented: p.consented === true,
+    };
+    if (!/^[A-Za-z0-9-]{8,64}$/.test(t.respondent_id)) throw new Error('bad respondent_id');
+  } catch (err) {
+    return json_({ ok: false, error: 'Invalid ping: ' + (err && err.message ? err.message : err) });
+  }
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return json_({ ok: false, error: 'busy' });
+  try {
+    if (!underRateLimit_('track', MAX_TRACK_PINGS_PER_MINUTE)) return json_({ ok: false, error: 'rate limited' });
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sessions = getOrCreateSheet_(ss, SESSIONS_SHEET, SESSION_HEADERS);
+    const now = new Date();
+    upsertSession_(sessions, t.respondent_id, (rec, isNew) => {
+      if (isNew) {
+        rec.first_seen_at = now;
+        rec.visits = 0;
+        rec.consented = false;
+        rec.completed = false;
+        rec.furthest_stage = t.stage;
+        rec.furthest_progress_pct = 0;
+      }
+      if (rec.completed === true) return; // a finished session is never changed by later pings
+      rec.condition = t.condition;
+      rec.phase_order = t.phase_order;
+      rec.survey_version = t.survey_version;
+      rec.last_seen_at = now;
+      if (t.event === 'load') rec.visits = (Number(rec.visits) || 0) + 1;
+      if (t.consented) rec.consented = true;
+      if (STAGES.indexOf(t.stage) > STAGES.indexOf(String(rec.furthest_stage))) rec.furthest_stage = t.stage;
+      rec.furthest_progress_pct = Math.max(Number(rec.furthest_progress_pct) || 0, t.progress_pct);
+    });
+    return json_({ ok: true });
+  } catch (err) {
+    console.error(err && err.stack ? err.stack : err);
+    return json_({ ok: false, error: 'Server error' });
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Finds the row for `id` in Sessions (or prepares a new one), lets `apply(rec, isNew)` edit
+ * the record, then writes back only the Sessions columns. Other columns you add to the
+ * tab are left alone.
+ */
+function upsertSession_(sheet, id, apply) {
+  const header = headerOf_(sheet);
+  const idCol = header.indexOf('respondent_id');
+  const lastRow = sheet.getLastRow();
+  let rowIndex = -1;
+  if (idCol !== -1 && lastRow >= 2) {
+    const ids = sheet.getRange(2, idCol + 1, lastRow - 1, 1).getValues();
+    for (let i = ids.length - 1; i >= 0; i--) {
+      if (String(ids[i][0]) === id) { rowIndex = i + 2; break; }
+    }
+  }
+
+  const isNew = rowIndex === -1;
+  const rec = { respondent_id: id };
+  if (!isNew) {
+    const values = sheet.getRange(rowIndex, 1, 1, header.length).getValues()[0];
+    header.forEach((h, i) => { rec[h] = values[i]; });
+  }
+  apply(rec, isNew);
+
+  if (isNew) {
+    appendRecords_(sheet, [rec]);
+  } else {
+    SESSION_HEADERS.forEach((h) => {
+      const col = header.indexOf(h);
+      if (col !== -1 && h !== 'respondent_id') {
+        sheet.getRange(rowIndex, col + 1).setValue(rec[h] === undefined || rec[h] === null ? '' : rec[h]);
+      }
+    });
+  }
 }
 
 /**
@@ -266,12 +415,13 @@ function date_(v) {
   return isNaN(d.getTime()) ? '' : d;
 }
 
-function underRateLimit_() {
+/** Per-minute counter per bucket ('submit' or 'track'); call only while holding the lock. */
+function underRateLimit_(bucket, max) {
   const cache = CacheService.getScriptCache();
-  const key = 'rate_' + Math.floor(Date.now() / 60000);
+  const key = 'rate_' + bucket + '_' + Math.floor(Date.now() / 60000);
   const count = Number(cache.get(key) || 0) + 1;
   cache.put(key, String(count), 120);
-  return count <= MAX_SUBMISSIONS_PER_MINUTE;
+  return count <= max;
 }
 
 // ============================================================ sheet helpers
